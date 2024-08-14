@@ -1,197 +1,202 @@
 import pandas as pd
-from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus, LpBinary
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus
 import numpy as np
-import folium
-from folium.plugins import PolyLineTextPath
-import math
-# Sample data ffor hubs
-hubs_data = {
-    'Site Reference': ['Hub01', 'Hub02', 'Hub03', 'Hub04', 'Hub05', 'Hub06', 'Hub07', 'Hub08', 'Hub09', 'Hub10'],
-    'X Coordinates': [51.5074, 53.4808, 55.9533, 52.4862, 53.4084, 52.6309, 54.9783, 53.8008, 50.3755, 55.8642],
-    'Y Coordinates': [-0.1278, -2.2426, -3.1883, -1.8904, -2.9916, 1.2974, -1.6174, -1.5491, -4.1427, -4.2518],
-    'Heat Available (kWh/year)': [500000, 750000, 600000, 450000, 800000, 700000, 650000, 550000, 720000, 600000],
-    'Cost of Heat (£/kWh)': [0.05, 0.04, 0.06, 0.05, 0.04, 0.06, 0.07, 0.05, 0.04, 0.06],
-    'Max Capacity (tonnes/year)': [10000, 15000, 12000, 9000, 16000, 14000, 13000, 11000, 15000, 12000]
-}
-hubs_df = pd.DataFrame(hubs_data)
+import matplotlib.pyplot as plt
 
-# Sample data for feedstock sources
-sources_data = {
-    'Site Reference': ['FS01', 'FS02', 'FS03', 'FS04', 'FS05', 'FS06', 'FS07', 'FS08', 'FS09', 'FS10'],
-    'X Coordinates': [52.2053, 51.5095, 53.7893, 51.4543, 50.8225, 51.4816, 53.7632, 52.4862, 50.7192, 55.3781],
-    'Y Coordinates': [0.1218, -0.0959, -2.2425, -2.5879, -0.1373, -0.4725, -2.7034, -1.8904, -1.8808, -3.4360],
-    'Available Quantity (tonnes/year)': [20000, 25000, 18000, 30000, 15000, 22000, 28000, 27000, 23000, 21000],
-    'Water Content (%)': [30, 25, 28, 22, 35, 32, 27, 29, 31, 26],
-    'Purchase Price (£/tonne)': [45, 50, 42, 48, 40, 47, 44, 49, 41, 46]
-}
-sources_df = pd.DataFrame(sources_data)
+import conventional_gen as cg
+import results_and_plotting as rp
+# Define the number of weeks
+number_of_weeks = 1
 
-# Key inputs
-conversion_factor = 0.7 #Feedstock to fertilizer, adjust as needed
-heat_required_per_tonne = 10  # in kWh per tonne of fertilizer, adjust as needed
-haulage_cost_per_tonne_mile = 0.02  # Example haulage cost
-minimum_total_production = 120000  # Example minimum total production requirement
-generic_capex = 100000  # Example generic CAPEX value for each hub
+# Load the demand profile and generation profiles from the Excel files
+demand_profile = pd.read_excel('demand_profile.xlsx', header=0)
+generation_profiles = pd.read_excel('generation_profiles.xlsx', header=0)
 
+# Extend the data for the number of weeks
+demand_profile = pd.concat([demand_profile] * number_of_weeks, ignore_index=True)
+generation_profiles = pd.concat([generation_profiles] * number_of_weeks, ignore_index=True)
 
-# Define the Haversine formula to calculate distances
-def haversine(lon1, lat1, lon2, lat2):
-    R = 6371  # Radius of the Earth in kilometers
-    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    distance = R * c
-    return distance
+# Define capacities for wind and solar (in MW)
+capacity_wind = 20
+capacity_solar = 20
+
+# Calculate the actual generation profiles by multiplying capacity factors by the defined capacities
+solar_generation = generation_profiles['Solar Capacity Factor'] * capacity_solar
+wind_generation = generation_profiles['Wind Capacity Factor'] * capacity_wind
+
+# Extract the demand profile
+demand = demand_profile['Demand']
+
+# Ensure the data is in the correct format (168 * number_of_weeks hourly intervals)
+time_horizon = 168 * number_of_weeks
+data = pd.DataFrame({
+    'Solar Generation (MW)': solar_generation,
+    'Wind Generation (MW)': wind_generation,
+    'Demand (MW)': demand
+})
 
 
-# Calculate distances between all sources and hubs
-distances = {}
-for _, source in sources_df.iterrows():
-    for _, hub in hubs_df.iterrows():
-        key = (source['Site Reference'], hub['Site Reference'])
-        distances[key] = haversine(source['Y Coordinates'], source['X Coordinates'],
-                                   hub['Y Coordinates'], hub['X Coordinates'])
+# Storage efficiencies and capacities
+efficiency_ldes = 0.85
+efficiency_sdes = 0.9
+efficiency_hydrogen = 0.75
 
-# Optimization problem setup
-prob = LpProblem("Minimize_Costs", LpMinimize)
+capacity_ldes = 1000  # in MWh
+capacity_sdes = 500   # in MWh
+capacity_hydrogen = 1500  # in MWh
 
-# Decision variables
-transport_vars = LpVariable.dicts("Transport",
-                                  [(i, j) for i in sources_df['Site Reference'] for j in hubs_df['Site Reference']],
-                                  lowBound=0, cat='Continuous')
-# Binary variables to indicate if a hub is active
-hub_active = LpVariable.dicts("HubActive",
-                              hubs_df['Site Reference'],
-                              cat='Binary')
+# Costs (example values)
+cost_solar = 10  # £/MWh
+cost_wind = 15  # £/MWh
+cost_ldes_charge = 5  # £/MWh
+cost_ldes_discharge = 7  # £/MWh
+cost_sdes_charge = 3  # £/MWh
+cost_sdes_discharge = 5  # £/MWh
+cost_hydrogen_charge = 8  # £/MWh
+cost_hydrogen_discharge = 10  # £/MWh
+cost_unmet_demand = 100  # £/MWh for unmet demand (high penalty)
+cost_curtailment = 5
 
-# Define costs
+# Create the LP problem
+prob = LpProblem("Least_Cost_Dispatch", LpMinimize)
 
-# Transportation costs
-transportation_costs = lpSum([transport_vars[i, j] * distances[(i, j)] * haulage_cost_per_tonne_mile
-                              for i, j in transport_vars])
+# Add conventional generation to the optimization problem
+Gen_Gas, Gen_Coal, Gen_Nuclear, Gen_Hydro = cg.add_conventional_generation(prob, data, time_horizon)
 
-# Production costs
-production_costs = lpSum([
-    (lpSum([transport_vars[i, j] for i in sources_df['Site Reference']]) * conversion_factor) *
-    hubs_df.set_index('Site Reference').at[j, 'Cost of Heat (£/kWh)'] *
-    heat_required_per_tonne
-    for j in hubs_df['Site Reference']
-])
+# Add demand response to the optimization problem
+Shift_Down, Shift_Up = cg.add_demand_response(prob, data, time_horizon)
+# Solve the optimization problem
 
-# CAPEX costs (only for active hubs)
-capex_costs = lpSum([hub_active[j] * generic_capex for j in hubs_df['Site Reference']])
+# Define decision variables
+Charge_LDES = LpVariable.dicts("Charge_LDES", range(time_horizon), lowBound=0, cat='Continuous')
+Discharge_LDES = LpVariable.dicts("Discharge_LDES", range(time_horizon), lowBound=0, cat='Continuous')
 
-# Objective function
-prob += transportation_costs + production_costs + capex_costs, "Total Costs"
+Charge_SDES = LpVariable.dicts("Charge_SDES", range(time_horizon), lowBound=0, cat='Continuous')
+Discharge_SDES = LpVariable.dicts("Discharge_SDES", range(time_horizon), lowBound=0, cat='Continuous')
 
-# Constraints
-for i in sources_df['Site Reference']:
-    prob += lpSum([transport_vars[i, j] for j in hubs_df['Site Reference']]) <= \
-            sources_df.set_index('Site Reference').at[i, 'Available Quantity (tonnes/year)'], f"Supply_constraint_{i}"
+Charge_Hydrogen = LpVariable.dicts("Charge_Hydrogen", range(time_horizon), lowBound=0, cat='Continuous')
+Discharge_Hydrogen = LpVariable.dicts("Discharge_Hydrogen", range(time_horizon), lowBound=0, cat='Continuous')
 
-for j in hubs_df['Site Reference']:
-    prob += (lpSum([transport_vars[i, j] for i in sources_df['Site Reference']]) * conversion_factor) <= \
-            hubs_df.set_index('Site Reference').at[j, 'Max Capacity (tonnes/year)'], f"Demand_constraint_{j}"
+Unmet_Demand = LpVariable.dicts("Unmet_Demand", range(time_horizon), lowBound=0, cat='Continuous')
+Curtailment = LpVariable.dicts("Curtailment", range(time_horizon), lowBound=0, cat='Continuous')
 
-# Ensure that if any feedstock is transported to a hub, the hub is active and capex is iccured for it
-for j in hubs_df['Site Reference']:
-    prob += lpSum([transport_vars[i, j] for i in sources_df['Site Reference']]) <= hub_active[j] * sum(
-        sources_df['Available Quantity (tonnes/year)']), f"Activation_constraint_{j}"
+# Objective: Minimize the total cost of generation, charging, discharging, and unmet demand
+prob += lpSum([
+    cost_solar * data['Solar Generation (MW)'][t] +
+    cost_wind * data['Wind Generation (MW)'][t] +
+    cost_ldes_charge * Charge_LDES[t] +
+    cost_ldes_discharge * Discharge_LDES[t] +
+    cost_sdes_charge * Charge_SDES[t] +
+    cost_sdes_discharge * Discharge_SDES[t] +
+    cost_hydrogen_charge * Charge_Hydrogen[t] +
+    cost_hydrogen_discharge * Discharge_Hydrogen[t] +
+    cost_unmet_demand * Unmet_Demand[t] +
+    cost_curtailment * Curtailment[t]
+    for t in range(time_horizon)
+]), "Total_Cost"
 
+# Set the initial state of charge (SOC) for each storage type to zero
+SOC_LDES = {0: 0}
+SOC_SDES = {0: 0}
+SOC_Hydrogen = {0: 0}
 
+# Additional constraint to ensure storage discharge only happens to meet demand
+for t in range(1, time_horizon):
+    # Define the SOC for each storage at time t
+    SOC_LDES[t] = LpVariable(f"SOC_LDES_{t}", lowBound=0, upBound=capacity_ldes)
+    SOC_SDES[t] = LpVariable(f"SOC_SDES_{t}", lowBound=0, upBound=capacity_sdes)
+    SOC_Hydrogen[t] = LpVariable(f"SOC_Hydrogen_{t}", lowBound=0, upBound=capacity_hydrogen)
 
-# Minimum total production constraint
-prob += lpSum([lpSum([transport_vars[i, j] for i in sources_df['Site Reference']]) * conversion_factor
-               for j in hubs_df['Site Reference']]) >= minimum_total_production, "Min_Total_Production"
+    # Storage dynamics
+    prob += SOC_LDES[t] == SOC_LDES[t-1] + Charge_LDES[t] * efficiency_ldes - Discharge_LDES[t] * (1 / efficiency_ldes), f"LDES_SOC_{t}"
+    prob += SOC_SDES[t] == SOC_SDES[t-1] + Charge_SDES[t] * efficiency_sdes - Discharge_SDES[t] * (1 / efficiency_sdes), f"SDES_SOC_{t}"
+    prob += SOC_Hydrogen[t] == SOC_Hydrogen[t-1] + Charge_Hydrogen[t] * efficiency_hydrogen - Discharge_Hydrogen[t] * (1 / efficiency_hydrogen), f"Hydrogen_SOC_{t}"
 
-# Solve the problem
+    # Ensure that the discharge from storage does not exceed the available SOC at that time
+    prob += Discharge_LDES[t] <= SOC_LDES[t-1], f"LDES_Discharge_Limit_{t}"
+    prob += Discharge_SDES[t] <= SOC_SDES[t-1], f"SDES_Discharge_Limit_{t}"
+    prob += Discharge_Hydrogen[t] <= SOC_Hydrogen[t-1], f"Hydrogen_Discharge_Limit_{t}"
+
+    # Discharge can only happen to meet demand
+    prob += Discharge_LDES[t] <= data['Demand (MW)'][t], f"LDES_Discharge_Meets_Demand_{t}"
+    prob += Discharge_SDES[t] <= data['Demand (MW)'][t], f"SDES_Discharge_Meets_Demand_{t}"
+    prob += Discharge_Hydrogen[t] <= data['Demand (MW)'][t], f"Hydrogen_Discharge_Meets_Demand_{t}"
+
+    # Capacity constraints
+    prob += SOC_LDES[t] <= capacity_ldes, f"LDES_Capacity_{t}"
+    prob += SOC_SDES[t] <= capacity_sdes, f"SDES_Capacity_{t}"
+    prob += SOC_Hydrogen[t] <= capacity_hydrogen, f"Hydrogen_Capacity_{t}"
+
+    
+
+   # Demand-Supply Constraint with Unmet Demand and Curtailed Energy
+for t in range(time_horizon):
+    prob += (
+        data['Solar Generation (MW)'][t] +
+        data['Wind Generation (MW)'][t] +
+        Discharge_LDES[t] +
+        Discharge_SDES[t] +
+        Discharge_Hydrogen[t] +
+        Gen_Gas[t] +
+        Gen_Coal[t] +
+        Gen_Nuclear[t] +
+        Gen_Hydro[t] +
+        Unmet_Demand[t]
+        == data['Demand (MW)'][t] +
+        Charge_LDES[t] +
+        Charge_SDES[t] +
+        Charge_Hydrogen[t] +
+        Curtailment[t]  # Add curtailment to ensure excess generation is handled
+    ), f"Demand_Supply_Constraint_{t}"
+
+# Final state of charge must be within capacity limits
+prob += SOC_LDES[time_horizon-1] <= capacity_ldes, "Final_LDES_SOC"
+prob += SOC_SDES[time_horizon-1] <= capacity_sdes, "Final_SDES_SOC"
+prob += SOC_Hydrogen[time_horizon-1] <= capacity_hydrogen, "Final_Hydrogen_SOC"
+
+# Solve the optimization problem
 prob.solve()
+
 print("Status:", LpStatus[prob.status])
 
-# Calculate total costs
-total_transportation_cost = sum(transport_vars[i, j].varValue * distances[(i, j)] * haulage_cost_per_tonne_mile
-                                for i, j in transport_vars)
+# Call functions from results_and_plotting.py
+rp.display_results(time_horizon, data, Discharge_LDES, Discharge_SDES, Discharge_Hydrogen, 
+                   Gen_Gas, Gen_Coal, Gen_Nuclear, Gen_Hydro, Unmet_Demand, Curtailment, 
+                   Charge_LDES, Charge_SDES, Charge_Hydrogen)
 
-total_production_cost = sum(
-    (sum(transport_vars[i, j].varValue for i in sources_df['Site Reference']) * conversion_factor) *
-    hubs_df.set_index('Site Reference').at[j, 'Cost of Heat (£/kWh)'] for j in hubs_df['Site Reference'])
+rp.plot_results(time_horizon, data, Discharge_LDES, Discharge_SDES, Discharge_Hydrogen, 
+                Gen_Gas, Gen_Coal, Gen_Nuclear, Gen_Hydro, Unmet_Demand)
 
-total_capex = sum(hub_active[j].varValue * generic_capex for j in hubs_df['Site Reference'])
+rp.plot_soc(time_horizon, SOC_LDES, SOC_SDES, SOC_Hydrogen)
 
-total_cost = total_transportation_cost + total_production_cost + total_capex
-
-# Calculate total production quantity
-total_production_quantity = sum(
-    sum(transport_vars[i, j].varValue for i in sources_df['Site Reference']) * conversion_factor
-    for j in hubs_df['Site Reference'])
-
-# Calculate cost per tonne produced
-cost_per_tonne_produced = total_cost / total_production_quantity
-
-# Output the results
-print(f"\nTotal transportation cost: £{total_transportation_cost:.2f}")
-print(f"Total production cost: £{total_production_cost:.2f}")
-print(f"Total CAPEX: £{total_capex:.2f}")
-print(f"Total cost: £{total_cost:.2f}")
-print(f"Total production quantity: {total_production_quantity:.2f} tonnes")
-print(f"Cost per tonne produced: £{cost_per_tonne_produced:.2f}")
-
-# Debug output to verify the results of the optimization
-print("\nProduction quantities at each hub:")
-for j in hubs_df['Site Reference']:
-    production_quantity = sum(transport_vars[i, j].varValue for i in sources_df['Site Reference']) * conversion_factor
-    print(f"Hub {j}: {production_quantity} tonnes")
-
-print("\nAmount of feedstock transported between each source and hub:")
-for (i, j) in transport_vars:
-    if transport_vars[i, j].varValue > 0:
-        print(f"Transport from Source {i} to Hub {j}: {transport_vars[i, j].varValue} tonnes")
-
-# Visualization with Folium
-map_osm = folium.Map(location=[55, -3], zoom_start=6)
-# Calculate maximum transported quantity for scaling line thickness
-max_transport = max(transport_vars[i, j].varValue for i, j in transport_vars)
-# Add markers for hubs with quantity used and maximum quantity
-for idx, row in hubs_df.iterrows():
-    production_quantity = sum(
-        transport_vars[i, row['Site Reference']].varValue for i in sources_df['Site Reference']) * conversion_factor
-    folium.Marker(
-        [row['X Coordinates'], row['Y Coordinates']],
-        popup=(f"Hub: {row['Site Reference']}<br>"
-               f"Quantity Used: {production_quantity:.2f} tonnes<br>"
-               f"Max Capacity: {row['Max Capacity (tonnes/year)']} tonnes"),
-        icon=folium.Icon(color='blue', icon='industry', prefix='fa')
-    ).add_to(map_osm)
-
-# Add markers for sources with available and used quantity
-for idx, row in sources_df.iterrows():
-    used_quantity = sum(transport_vars[row['Site Reference'], j].varValue for j in hubs_df['Site Reference'] if
-                        (row['Site Reference'], j) in transport_vars)
-    folium.Marker(
-        [row['X Coordinates'], row['Y Coordinates']],
-        popup=(f"Source: {row['Site Reference']}<br>"
-               f"Available Quantity: {row['Available Quantity (tonnes/year)']} tonnes<br>"
-               f"Quantity Used: {used_quantity:.2f} tonnes"),
-        icon=folium.Icon(color='green', icon='leaf', prefix='fa')
-    ).add_to(map_osm)
-
-# Add lines for transportation routes (only where transport is greater than 0) with a single arrow in the center
-for (i, j) in transport_vars:
-    if transport_vars[i, j].varValue > 0:
-        source = sources_df[sources_df['Site Reference'] == i].iloc[0]
-        hub = hubs_df[hubs_df['Site Reference'] == j].iloc[0]
-        line_weight = (transport_vars[i, j].varValue / max_transport) * 10  # Scale line thickness
-
-        line = folium.PolyLine(
-            locations=[(source['X Coordinates'], source['Y Coordinates']),
-                       (hub['X Coordinates'], hub['Y Coordinates'])],
-            weight=line_weight, color='red',
-            popup=(f"Transport from {i} to {j}: {transport_vars[i, j].varValue:.2f} tonnes")
-        ).add_to(map_osm)
-
-
-
-# Save or display the map
-map_osm.save('full_network_map.html')
+rp.plot_energy_flow(time_horizon, data, Discharge_LDES, Discharge_SDES, Discharge_Hydrogen, 
+                    Gen_Gas, Gen_Coal, Gen_Nuclear, Gen_Hydro, Charge_LDES, Charge_SDES, 
+                    Charge_Hydrogen, Unmet_Demand)
+# Generate the comprehensive report
+rp.generate_report(
+    filename='optimization_report.xlsx',
+    time_horizon=time_horizon,
+    data=data,
+    Discharge_LDES=Discharge_LDES,
+    Discharge_SDES=Discharge_SDES,
+    Discharge_Hydrogen=Discharge_Hydrogen,
+    Gen_Gas=Gen_Gas,
+    Gen_Coal=Gen_Coal,
+    Gen_Nuclear=Gen_Nuclear,
+    Gen_Hydro=Gen_Hydro,
+    Unmet_Demand=Unmet_Demand,
+    Curtailment=Curtailment,
+    Charge_LDES=Charge_LDES,
+    Charge_SDES=Charge_SDES,
+    Charge_Hydrogen=Charge_Hydrogen,
+    cost_solar=cost_solar,
+    cost_wind=cost_wind,
+    cost_ldes_charge=cost_ldes_charge,
+    cost_ldes_discharge=cost_ldes_discharge,
+    cost_sdes_charge=cost_sdes_charge,
+    cost_sdes_discharge=cost_sdes_discharge,
+    cost_hydrogen_charge=cost_hydrogen_charge,
+    cost_hydrogen_discharge=cost_hydrogen_discharge,
+    cost_unmet_demand=cost_unmet_demand,
+    cost_curtailment=cost_curtailment
+)
